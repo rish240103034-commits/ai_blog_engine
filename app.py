@@ -15,19 +15,31 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-# Set your Gemini API key here OR via environment variable GEMINI_API_KEY
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE")
-genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Use Gemini 1.5 Flash — free tier, fast
-model = genai.GenerativeModel("gemini-2.0-flash")
+# Lazy-load model so missing key doesn't crash on startup
+model = None
+
+def get_model():
+    """Initialize Gemini model lazily — safe for cold starts on Render."""
+    global model
+    if model is not None:
+        return model
+    key = GEMINI_API_KEY
+    if not key:
+        raise ValueError("GEMINI_API_KEY environment variable is not set. "
+                         "Add it in Render → your service → Environment tab.")
+    genai.configure(api_key=key)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    return model
 
 
 def call_gemini(prompt: str, retries: int = 4) -> str:
     """Call Gemini API with automatic retry + exponential backoff on rate limit."""
+    m = get_model()
     for attempt in range(retries):
         try:
-            response = model.generate_content(prompt)
+            response = m.generate_content(prompt)
             time.sleep(4)  # 4s gap between calls to stay within free quota
             return response.text.strip()
         except Exception as e:
@@ -422,6 +434,11 @@ def generate():
         return jsonify({"error": "Keyword too long (max 200 characters)"}), 400
 
     try:
+        # Validate API key early — return clear JSON error, not HTML crash
+        if not GEMINI_API_KEY:
+            return jsonify({"error": "GEMINI_API_KEY is not set on the server. "
+                            "Go to Render → your service → Environment → add GEMINI_API_KEY."}), 500
+
         # ── Agent 1: Intent Analysis
         print(f"[Agent 1] Analyzing intent for: {keyword}")
         intent = intent_analyzer_agent(keyword)
