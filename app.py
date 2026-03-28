@@ -6,6 +6,7 @@ Backend: Flask + Google Gemini API (Free)
 import os
 import json
 import re
+import time
 from flask import Flask, request, jsonify, render_template
 import google.generativeai as genai
 
@@ -22,13 +23,22 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
 
 
-def call_gemini(prompt: str) -> str:
-    """Call Gemini API and return the text response."""
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        return f"ERROR: {str(e)}"
+def call_gemini(prompt: str, retries: int = 4) -> str:
+    """Call Gemini API with automatic retry + exponential backoff on rate limit."""
+    for attempt in range(retries):
+        try:
+            response = model.generate_content(prompt)
+            time.sleep(4)  # 4s gap between calls to stay within free quota
+            return response.text.strip()
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
+                wait = 15 * (attempt + 1)  # 15s, 30s, 45s, 60s
+                print(f"[Rate limit] Waiting {wait}s before retry {attempt+1}/{retries}...")
+                time.sleep(wait)
+            else:
+                return f"ERROR: {msg}"
+    return "ERROR: Rate limit exceeded after retries. Wait 1 minute and try again."
 
 
 # ─────────────────────────────────────────────
