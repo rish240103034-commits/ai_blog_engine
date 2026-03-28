@@ -18,41 +18,52 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# Primary key — set in Render > Environment
+GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
+# Optional backup key from a second Google account (leave blank if unused)
+GEMINI_API_KEY2 = os.environ.get("GEMINI_API_KEY2", "")
 
-_model = None
+_models = {}  # cache per key
 
-def get_model():
-    global _model
-    if _model is not None:
-        return _model
-    if not GEMINI_API_KEY:
-        raise ValueError(
-            "GEMINI_API_KEY is not set. "
-            "Go to Render > your service > Environment > add GEMINI_API_KEY."
-        )
-    genai.configure(api_key=GEMINI_API_KEY)
-    _model = genai.GenerativeModel("gemini-2.0-flash")
-    return _model
+def get_model(key: str):
+    if key in _models:
+        return _models[key]
+    genai.configure(api_key=key)
+    _models[key] = genai.GenerativeModel("gemini-2.0-flash")
+    return _models[key]
 
 
 def call_gemini(prompt: str, retries: int = 3) -> str:
-    """Call Gemini with retry on rate-limit. No artificial sleep."""
-    m = get_model()
-    for attempt in range(retries):
-        try:
-            response = m.generate_content(prompt)
-            return response.text.strip()
-        except Exception as e:
-            msg = str(e)
-            if ("429" in msg or "quota" in msg.lower() or "rate" in msg.lower()) \
-                    and attempt < retries - 1:
-                wait = 8 * (attempt + 1)
-                print(f"[Rate limit] waiting {wait}s (attempt {attempt+1})...")
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError("Gemini rate-limited after retries. Wait 1 min and try again.")
+    """Call Gemini. On 429, auto-switch to backup key if available."""
+    keys = [k for k in [GEMINI_API_KEY, GEMINI_API_KEY2] if k]
+    if not keys:
+        raise ValueError(
+            "GEMINI_API_KEY not set. Render > your service > Environment > add GEMINI_API_KEY."
+        )
+    last_err = None
+    for key in keys:
+        m = get_model(key)
+        for attempt in range(retries):
+            try:
+                response = m.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e:
+                msg = str(e)
+                is_rate = "429" in msg or "quota" in msg.lower() or "rate" in msg.lower()
+                if is_rate and attempt < retries - 1:
+                    wait = 5 * (attempt + 1)
+                    print(f"[Rate limit on key ...{key[-6:]}] waiting {wait}s...")
+                    time.sleep(wait)
+                elif is_rate:
+                    last_err = e
+                    print(f"[Key ...{key[-6:]}] exhausted, trying backup key...")
+                    break  # try next key
+                else:
+                    raise  # non-rate errors bubble up immediately
+    raise RuntimeError(
+        "429 Rate limit exceeded on all keys. Wait 1 minute and try again. "
+        "Tip: add GEMINI_API_KEY2 in Render Environment with a key from a second Google account."
+    )
 
 
 # ── BATCH CALL 1: Intent + Keywords + SERP Gap (3 agents, 1 API call)
