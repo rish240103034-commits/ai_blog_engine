@@ -1,6 +1,9 @@
 """
 AI Blog Engine - Multi-Agent Blog Generation System
 Backend: Flask + Google Gemini API (Free)
+
+OPTIMIZED: 3 batched Gemini calls instead of 7 sequential ones.
+Completes in ~20s — safe for Render free tier (30s timeout).
 """
 
 import os
@@ -17,411 +20,252 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Lazy-load model so missing key doesn't crash on startup
-model = None
+_model = None
 
 def get_model():
-    """Initialize Gemini model lazily — safe for cold starts on Render."""
-    global model
-    if model is not None:
-        return model
-    key = GEMINI_API_KEY
-    if not key:
-        raise ValueError("GEMINI_API_KEY environment variable is not set. "
-                         "Add it in Render → your service → Environment tab.")
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    return model
+    global _model
+    if _model is not None:
+        return _model
+    if not GEMINI_API_KEY:
+        raise ValueError(
+            "GEMINI_API_KEY is not set. "
+            "Go to Render > your service > Environment > add GEMINI_API_KEY."
+        )
+    genai.configure(api_key=GEMINI_API_KEY)
+    _model = genai.GenerativeModel("gemini-2.0-flash")
+    return _model
 
 
-def call_gemini(prompt: str, retries: int = 4) -> str:
-    """Call Gemini API with automatic retry + exponential backoff on rate limit."""
+def call_gemini(prompt: str, retries: int = 3) -> str:
+    """Call Gemini with retry on rate-limit. No artificial sleep."""
     m = get_model()
     for attempt in range(retries):
         try:
             response = m.generate_content(prompt)
-            time.sleep(4)  # 4s gap between calls to stay within free quota
             return response.text.strip()
         except Exception as e:
             msg = str(e)
-            if "429" in msg or "quota" in msg.lower() or "rate" in msg.lower():
-                wait = 15 * (attempt + 1)  # 15s, 30s, 45s, 60s
-                print(f"[Rate limit] Waiting {wait}s before retry {attempt+1}/{retries}...")
+            if ("429" in msg or "quota" in msg.lower() or "rate" in msg.lower()) \
+                    and attempt < retries - 1:
+                wait = 8 * (attempt + 1)
+                print(f"[Rate limit] waiting {wait}s (attempt {attempt+1})...")
                 time.sleep(wait)
             else:
-                return f"ERROR: {msg}"
-    return "ERROR: Rate limit exceeded after retries. Wait 1 minute and try again."
+                raise
+    raise RuntimeError("Gemini rate-limited after retries. Wait 1 min and try again.")
 
 
-# ─────────────────────────────────────────────
-# AGENT 1: Intent Analyzer
-# ─────────────────────────────────────────────
-def intent_analyzer_agent(keyword: str) -> dict:
-    """
-    Analyzes the search intent behind a keyword.
-    Returns intent type and confidence reasoning.
-    """
+# ── BATCH CALL 1: Intent + Keywords + SERP Gap (3 agents, 1 API call)
+def batch_research(keyword: str) -> dict:
     prompt = f"""
-You are an expert SEO Intent Analyzer Agent.
+You are a multi-agent SEO research system. For the keyword "{keyword}", run all three
+agents below and return ONE valid JSON object containing all results.
 
-Analyze the search intent for the keyword: "{keyword}"
-
-Respond ONLY in valid JSON format like this:
+Return ONLY this JSON (no markdown fences, no extra text):
 {{
-  "intent_type": "informational|commercial|transactional|navigational",
-  "confidence": "high|medium|low",
-  "reasoning": "Brief explanation of why this intent was classified this way",
-  "user_goal": "What the user is trying to achieve",
-  "content_type": "What type of content best serves this intent (e.g., how-to guide, product comparison, listicle)"
+  "intent": {{
+    "intent_type": "informational|commercial|transactional|navigational",
+    "confidence": "high|medium|low",
+    "reasoning": "brief reason",
+    "user_goal": "what user wants to achieve",
+    "content_type": "best content type e.g. how-to guide"
+  }},
+  "keywords": {{
+    "primary_keyword": "{keyword}",
+    "secondary_keywords": ["kw1", "kw2", "kw3", "kw4", "kw5"],
+    "long_tail_keywords": ["phrase1", "phrase2", "phrase3", "phrase4"],
+    "lsi_keywords": ["lsi1", "lsi2", "lsi3"],
+    "question_keywords": ["What is...?", "How to...?", "Why does...?", "When should...?"],
+    "search_volume_estimate": "high|medium|low",
+    "competition_level": "high|medium|low"
+  }},
+  "serp_gaps": {{
+    "common_topics_covered": ["topic1", "topic2", "topic3"],
+    "content_gaps": ["Gap 1: ...", "Gap 2: ...", "Gap 3: ..."],
+    "unique_angles": ["Angle 1", "Angle 2", "Angle 3"],
+    "competitor_weaknesses": ["Weakness 1", "Weakness 2"],
+    "our_opportunity": "The biggest content opportunity in one sentence",
+    "recommended_word_count": 1600
+  }}
 }}
-
-Return ONLY the JSON, no extra text.
 """
     raw = call_gemini(prompt)
+    raw = re.sub(r"```json|```", "", raw).strip()
     try:
-        # Strip markdown code fences if present
-        raw = re.sub(r"```json|```", "", raw).strip()
         return json.loads(raw)
     except Exception:
         return {
-            "intent_type": "informational",
-            "confidence": "medium",
-            "reasoning": raw,
-            "user_goal": "Learn about the topic",
-            "content_type": "Educational guide"
+            "intent": {
+                "intent_type": "informational", "confidence": "medium",
+                "reasoning": "Analysis complete", "user_goal": "Learn about the topic",
+                "content_type": "Educational guide"
+            },
+            "keywords": {
+                "primary_keyword": keyword, "secondary_keywords": [],
+                "long_tail_keywords": [], "lsi_keywords": [], "question_keywords": [],
+                "search_volume_estimate": "medium", "competition_level": "medium"
+            },
+            "serp_gaps": {
+                "common_topics_covered": [], "content_gaps": ["Depth", "Examples", "Stats"],
+                "unique_angles": [], "competitor_weaknesses": [],
+                "our_opportunity": "Comprehensive coverage", "recommended_word_count": 1600
+            }
         }
 
 
-# ─────────────────────────────────────────────
-# AGENT 2: Keyword Clustering
-# ─────────────────────────────────────────────
-def keyword_clustering_agent(keyword: str, intent: dict) -> dict:
-    """
-    Generates a full keyword cluster around the primary keyword.
-    """
+# ── BATCH CALL 2: Outline + Blog (2 agents, 1 API call)
+def batch_outline_and_blog(keyword: str, research: dict) -> dict:
+    kws       = research.get("keywords", {})
+    gaps      = research.get("serp_gaps", {})
+    secondary = ", ".join(kws.get("secondary_keywords", [])[:4])
+    long_tail = ", ".join(kws.get("long_tail_keywords", [])[:3])
+    gap_list  = "\n".join(f"- {g}" for g in gaps.get("content_gaps", []))
+    angles    = "\n".join(f"- {a}" for a in gaps.get("unique_angles", []))
+
     prompt = f"""
-You are an expert SEO Keyword Research Agent.
+You are a dual-mode SEO content system. For the keyword "{keyword}", complete TWO tasks
+and return ONE JSON object.
 
-Primary Keyword: "{keyword}"
-Search Intent: {intent.get("intent_type", "informational")}
+Context:
+- Secondary keywords: {secondary}
+- Long-tail keywords: {long_tail}
+- Content gaps:
+{gap_list}
+- Unique angles:
+{angles}
 
-Generate a comprehensive keyword cluster. Respond ONLY in valid JSON:
+TASK 1: Create the SEO blog outline.
+TASK 2: Write the full blog post following that outline.
+
+Blog rules:
+- 1200-1500 words
+- Use ## for H2 headings, ### for H3
+- Use "{keyword}" naturally throughout
+- Conversational expert tone with personality
+- No cliches: no "In conclusion", "In today's world", "Delve into"
+- Include practical tips and real examples
+
+Return ONLY this JSON (no markdown fences, no extra text):
 {{
-  "primary_keyword": "{keyword}",
-  "secondary_keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"],
-  "long_tail_keywords": [
-    "long tail phrase 1",
-    "long tail phrase 2",
-    "long tail phrase 3",
-    "long tail phrase 4",
-    "long tail phrase 5"
-  ],
-  "lsi_keywords": ["semantic keyword1", "semantic keyword2", "semantic keyword3"],
-  "question_keywords": [
-    "What is...",
-    "How to...",
-    "Why does...",
-    "When should..."
-  ],
-  "search_volume_estimate": "high|medium|low",
-  "competition_level": "high|medium|low"
+  "outline": {{
+    "h1_title": "Compelling SEO title containing the keyword",
+    "meta_description": "150-160 char meta description with keyword",
+    "intro_hook": "One sentence hook",
+    "sections": [
+      {{
+        "h2": "Section heading",
+        "purpose": "what this section covers",
+        "h3_subsections": ["Subsection 1", "Subsection 2"]
+      }}
+    ],
+    "conclusion_summary": "What the conclusion covers",
+    "estimated_read_time": "7 min read",
+    "target_word_count": 1400
+  }},
+  "blog": "FULL BLOG POST IN MARKDOWN. Use actual newline characters for line breaks."
 }}
-
-Return ONLY the JSON, no extra text.
 """
     raw = call_gemini(prompt)
+    raw = re.sub(r"```json|```", "", raw).strip()
     try:
-        raw = re.sub(r"```json|```", "", raw).strip()
         return json.loads(raw)
     except Exception:
         return {
-            "primary_keyword": keyword,
-            "secondary_keywords": [],
-            "long_tail_keywords": [],
-            "lsi_keywords": [],
-            "question_keywords": [],
-            "search_volume_estimate": "medium",
-            "competition_level": "medium"
+            "outline": {
+                "h1_title": f"The Complete Guide to {keyword}",
+                "meta_description": f"Everything about {keyword}: expert tips, strategies, and practical advice you can use today.",
+                "intro_hook": f"Introduction to {keyword}",
+                "sections": [],
+                "conclusion_summary": "Key takeaways",
+                "estimated_read_time": "7 min read",
+                "target_word_count": 1400
+            },
+            "blog": raw
         }
 
 
-# ─────────────────────────────────────────────
-# AGENT 3: SERP Gap Analysis
-# ─────────────────────────────────────────────
-def serp_gap_analysis_agent(keyword: str, keywords: dict) -> dict:
-    """
-    Identifies content gaps and opportunities vs. competitor blogs.
-    """
-    secondary = ", ".join(keywords.get("secondary_keywords", [])[:3])
-    prompt = f"""
-You are an expert SERP Gap Analysis Agent for content strategy.
-
-Primary Keyword: "{keyword}"
-Related Keywords: {secondary}
-
-Analyze what content gaps exist in typical top-ranking articles for this keyword.
-Respond ONLY in valid JSON:
-{{
-  "common_topics_covered": ["topic1", "topic2", "topic3"],
-  "content_gaps": [
-    "Gap 1: What most articles miss...",
-    "Gap 2: Rarely covered angle...",
-    "Gap 3: Missing depth on..."
-  ],
-  "unique_angles": [
-    "Unique angle 1",
-    "Unique angle 2",
-    "Unique angle 3"
-  ],
-  "competitor_weaknesses": [
-    "Weakness 1",
-    "Weakness 2"
-  ],
-  "our_opportunity": "Summary of the biggest content opportunity to outrank competitors",
-  "recommended_word_count": 1500
-}}
-
-Return ONLY the JSON, no extra text.
-"""
-    raw = call_gemini(prompt)
-    try:
-        raw = re.sub(r"```json|```", "", raw).strip()
-        return json.loads(raw)
-    except Exception:
-        return {
-            "common_topics_covered": [],
-            "content_gaps": ["Depth of explanation", "Practical examples", "Latest statistics"],
-            "unique_angles": [],
-            "competitor_weaknesses": [],
-            "our_opportunity": raw,
-            "recommended_word_count": 1500
-        }
-
-
-# ─────────────────────────────────────────────
-# AGENT 4: Outline Generator
-# ─────────────────────────────────────────────
-def outline_generator_agent(keyword: str, keywords: dict, gaps: dict) -> dict:
-    """
-    Creates a fully SEO-optimized blog outline with H1/H2/H3 structure.
-    """
-    gaps_text = "\n".join(gaps.get("content_gaps", []))
-    angles_text = "\n".join(gaps.get("unique_angles", []))
-    prompt = f"""
-You are an expert Blog Outline Architect Agent.
-
-Primary Keyword: "{keyword}"
-Secondary Keywords: {", ".join(keywords.get("secondary_keywords", [])[:4])}
-Content Gaps to Address:
-{gaps_text}
-Unique Angles:
-{angles_text}
-
-Create a fully SEO-optimized blog outline. Respond ONLY in valid JSON:
-{{
-  "h1_title": "Compelling, keyword-rich H1 title",
-  "meta_description": "150-160 character meta description with primary keyword",
-  "intro_hook": "One sentence describing what the intro paragraph will cover",
-  "sections": [
-    {{
-      "h2": "Section heading",
-      "purpose": "What this section covers",
-      "h3_subsections": ["Subsection 1", "Subsection 2"]
-    }}
-  ],
-  "conclusion_summary": "What the conclusion will wrap up",
-  "estimated_read_time": "X min read",
-  "target_word_count": 1800
-}}
-
-Include 5-7 H2 sections with 2-3 H3 subsections each.
-Return ONLY the JSON, no extra text.
-"""
-    raw = call_gemini(prompt)
-    try:
-        raw = re.sub(r"```json|```", "", raw).strip()
-        return json.loads(raw)
-    except Exception:
-        return {
-            "h1_title": f"Complete Guide to {keyword}",
-            "meta_description": f"Learn everything about {keyword} in this comprehensive guide.",
-            "intro_hook": "Introduction to the topic",
-            "sections": [],
-            "conclusion_summary": "Summary",
-            "estimated_read_time": "8 min read",
-            "target_word_count": 1800
-        }
-
-
-# ─────────────────────────────────────────────
-# AGENT 5: Blog Generator
-# ─────────────────────────────────────────────
-def blog_generator_agent(keyword: str, keywords: dict, outline: dict) -> str:
-    """
-    Generates the full blog post following the outline and keyword targets.
-    """
-    sections_text = ""
-    for s in outline.get("sections", []):
-        sections_text += f"\n- H2: {s.get('h2', '')}"
-        for h3 in s.get("h3_subsections", []):
-            sections_text += f"\n  - H3: {h3}"
+# ── BATCH CALL 3: Humanizer (1 API call)
+def humanize_blog(blog_content: str, keyword: str) -> str:
+    if len(blog_content.split()) < 100:
+        return blog_content
 
     prompt = f"""
-You are an expert Blog Content Writer Agent. Write a full, engaging, SEO-optimized blog post.
+Rewrite the blog below to sound genuinely human — confident, warm, expert.
+Keep all markdown headings (## and ###) and the keyword "{keyword}".
 
-Title: {outline.get("h1_title", keyword)}
-Primary Keyword: "{keyword}"
-Secondary Keywords: {", ".join(keywords.get("secondary_keywords", [])[:5])}
-Long-tail Keywords: {", ".join(keywords.get("long_tail_keywords", [])[:3])}
+Rules:
+- Keep 1200-1500 words
+- Vary sentence length dramatically
+- Use contractions naturally (it's, you'll, don't, we're)
+- Remove AI cliches (delve, It's worth noting, In today's fast-paced world)
+- Add one or two rhetorical questions
+- Keep every ## and ### heading exactly as written
 
-Blog Structure to Follow:
-{sections_text}
+Blog:
+---
+{blog_content[:5000]}
+---
 
-Requirements:
-- Write 1500-2000 words
-- Use markdown formatting (## for H2, ### for H3)
-- Include the primary keyword naturally every 150-200 words
-- Add a compelling introduction with a hook
-- Include practical examples and actionable tips
-- Add a strong conclusion with a call to action
-- Do NOT use generic phrases like "In conclusion" or "In summary"
-- Write in a confident, authoritative yet conversational tone
-- Include relevant statistics or data points where appropriate
-
-Start writing the full blog post now:
+Write the humanized version in markdown now (no JSON, just the blog text):
 """
-    return call_gemini(prompt)
+    result = call_gemini(prompt)
+    return result if result and len(result.split()) > 80 else blog_content
 
 
-# ─────────────────────────────────────────────
-# AGENT 6: SEO Optimizer
-# ─────────────────────────────────────────────
-def seo_optimizer_agent(keyword: str, blog_content: str, outline: dict) -> dict:
-    """
-    Analyzes the generated blog for SEO quality and returns a score + recommendations.
-    """
-    word_count = len(blog_content.split())
-    keyword_count = blog_content.lower().count(keyword.lower())
-    keyword_density = round((keyword_count / max(word_count, 1)) * 100, 2)
-    has_h2 = "##" in blog_content and "###" not in blog_content[:5]
-    has_h3 = "###" in blog_content
-    meta_desc = outline.get("meta_description", "")
-    meta_length = len(meta_desc)
+# ── SEO Scorer (pure Python — no API call)
+def seo_score(keyword: str, blog: str, outline: dict) -> dict:
+    wc       = len(blog.split())
+    kw_count = blog.lower().count(keyword.lower())
+    density  = round((kw_count / max(wc, 1)) * 100, 2)
+    has_h2   = "## " in blog
+    has_h3   = "### " in blog
+    meta     = outline.get("meta_description", "")
+    meta_len = len(meta)
+    title    = outline.get("h1_title", "")
 
-    # Scoring logic
     score = 0
-    recommendations = []
+    recs  = []
 
-    # Word count score (max 20)
-    if word_count >= 1500:
-        score += 20
-    elif word_count >= 1000:
-        score += 12
-        recommendations.append("Increase word count to at least 1500 for better ranking potential.")
-    else:
-        score += 5
-        recommendations.append("Content is too short. Aim for 1500+ words.")
+    if wc >= 1200:   score += 20
+    elif wc >= 800:  score += 12; recs.append("Increase word count above 1200 for better SEO.")
+    else:            score += 5;  recs.append("Content too short — aim for 1200+ words.")
 
-    # Keyword density score (max 20)
-    if 0.5 <= keyword_density <= 2.5:
-        score += 20
-    elif keyword_density < 0.5:
-        score += 8
-        recommendations.append(f"Keyword density is low ({keyword_density}%). Use '{keyword}' more naturally.")
-    else:
-        score += 8
-        recommendations.append(f"Keyword density is high ({keyword_density}%). Reduce keyword stuffing.")
+    if 0.5 <= density <= 2.5:  score += 20
+    elif density < 0.5:        score += 8;  recs.append(f"Low keyword density ({density}%). Use '{keyword}' more naturally.")
+    else:                      score += 8;  recs.append(f"High keyword density ({density}%). Reduce repetition.")
 
-    # Headings score (max 20)
-    if has_h2 and has_h3:
-        score += 20
-    elif has_h2:
-        score += 12
-        recommendations.append("Add H3 subheadings to improve content structure.")
-    else:
-        score += 0
-        recommendations.append("Missing H2 and H3 headings. Use proper heading hierarchy.")
+    if has_h2 and has_h3:  score += 20
+    elif has_h2:           score += 12; recs.append("Add H3 subheadings for better structure.")
+    else:                  recs.append("Missing H2/H3 headings — add proper structure.")
 
-    # Meta description score (max 20)
-    if 140 <= meta_length <= 160:
-        score += 20
-    elif 100 <= meta_length < 140:
-        score += 12
-        recommendations.append("Meta description could be slightly longer (aim for 150-160 chars).")
-    elif meta_length > 160:
-        score += 10
-        recommendations.append("Meta description is too long. Keep it under 160 characters.")
-    else:
-        score += 5
-        recommendations.append("Meta description is missing or too short.")
+    if 140 <= meta_len <= 160:   score += 20
+    elif 100 <= meta_len < 140:  score += 12; recs.append("Meta description slightly short (aim 150-160 chars).")
+    elif meta_len > 160:         score += 10; recs.append("Meta description too long — trim to 160 chars.")
+    else:                        score += 5;  recs.append("Meta description missing or too short.")
 
-    # Keyword in title (max 10)
-    if keyword.lower() in outline.get("h1_title", "").lower():
-        score += 10
-    else:
-        recommendations.append("Include the primary keyword in the H1 title.")
+    if keyword.lower() in title.lower():  score += 10
+    else:                                 recs.append("Add the primary keyword to the H1 title.")
 
-    # Content quality heuristic (max 10)
-    if word_count > 0 and keyword_count > 0:
-        score += 10
+    if wc > 0 and kw_count > 0:  score += 10
 
+    score = min(score, 100)
     return {
-        "seo_score": min(score, 100),
-        "word_count": word_count,
-        "keyword_count": keyword_count,
-        "keyword_density": keyword_density,
+        "seo_score": score,
+        "word_count": wc,
+        "keyword_count": kw_count,
+        "keyword_density": density,
         "has_proper_headings": has_h2 and has_h3,
-        "meta_description_length": meta_length,
-        "recommendations": recommendations if recommendations else ["Great job! Your content is well-optimized."],
+        "meta_description_length": meta_len,
+        "recommendations": recs if recs else ["Great job! Content is well-optimized."],
         "grade": "A" if score >= 85 else "B" if score >= 70 else "C" if score >= 55 else "D"
     }
 
 
 # ─────────────────────────────────────────────
-# AGENT 7: Humanizer Agent
-# ─────────────────────────────────────────────
-def humanizer_agent(blog_content: str, keyword: str) -> str:
-    """
-    Rewrites content to sound more natural and human-like,
-    reducing AI detection patterns.
-    """
-    prompt = f"""
-You are an expert Content Humanizer Agent. Your job is to rewrite AI-generated content 
-to sound authentically human, while keeping all the SEO value and information intact.
-
-Here is the blog post to humanize:
-
----
-{blog_content}
----
-
-Rewriting Rules:
-1. Replace overly formal or robotic phrases with natural language
-2. Add personality — occasional humor, rhetorical questions, relatable analogies
-3. Vary sentence length dramatically (mix short punchy sentences with longer ones)
-4. Remove clichés like "In today's fast-paced world", "Delve into", "In conclusion"
-5. Add first-person perspective where appropriate ("I've seen...", "In my experience...")
-6. Use contractions naturally (it's, you'll, don't, we're)
-7. Keep all markdown headings (## and ###) and structure intact
-8. Keep the primary keyword "{keyword}" in the content
-9. Target 1500-2000 words
-10. Make it sound like an expert who genuinely enjoys the topic
-
-Write the humanized version now (markdown format):
-"""
-    return call_gemini(prompt)
-
-
-# ─────────────────────────────────────────────
-# MAIN API ENDPOINT
+# MAIN ENDPOINT
 # ─────────────────────────────────────────────
 @app.route("/generate", methods=["POST"])
 def generate():
-    """
-    Main endpoint that orchestrates all 7 agents in sequence.
-    Accepts: { "keyword": "your keyword here" }
-    Returns: Full JSON with all agent outputs
-    """
     data = request.get_json()
     if not data or "keyword" not in data:
         return jsonify({"error": "Missing 'keyword' in request body"}), 400
@@ -429,61 +273,39 @@ def generate():
     keyword = data["keyword"].strip()
     if not keyword:
         return jsonify({"error": "Keyword cannot be empty"}), 400
-
     if len(keyword) > 200:
-        return jsonify({"error": "Keyword too long (max 200 characters)"}), 400
+        return jsonify({"error": "Keyword too long (max 200 chars)"}), 400
+    if not GEMINI_API_KEY:
+        return jsonify({"error":
+            "GEMINI_API_KEY not set. Render > your service > Environment > add GEMINI_API_KEY."}), 500
 
     try:
-        # Validate API key early — return clear JSON error, not HTML crash
-        if not GEMINI_API_KEY:
-            return jsonify({"error": "GEMINI_API_KEY is not set on the server. "
-                            "Go to Render → your service → Environment → add GEMINI_API_KEY."}), 500
+        print(f"[1/3] Research — {keyword}")
+        research = batch_research(keyword)
 
-        # ── Agent 1: Intent Analysis
-        print(f"[Agent 1] Analyzing intent for: {keyword}")
-        intent = intent_analyzer_agent(keyword)
+        print("[2/3] Outline + Blog")
+        content  = batch_outline_and_blog(keyword, research)
+        outline  = content.get("outline", {})
+        raw_blog = content.get("blog", "")
 
-        # ── Agent 2: Keyword Clustering
-        print("[Agent 2] Generating keyword cluster...")
-        keywords = keyword_clustering_agent(keyword, intent)
-
-        # ── Agent 3: SERP Gap Analysis
-        print("[Agent 3] Running SERP gap analysis...")
-        serp_gaps = serp_gap_analysis_agent(keyword, keywords)
-
-        # ── Agent 4: Outline Generation
-        print("[Agent 4] Generating blog outline...")
-        outline = outline_generator_agent(keyword, keywords, serp_gaps)
-
-        # ── Agent 5: Blog Generation
-        print("[Agent 5] Writing full blog content...")
-        raw_blog = blog_generator_agent(keyword, keywords, outline)
-
-        # ── Agent 6: SEO Optimization Check
-        print("[Agent 6] Running SEO optimization analysis...")
-        seo_report = seo_optimizer_agent(keyword, raw_blog, outline)
-
-        # ── Agent 7: Humanize Content
-        print("[Agent 7] Humanizing content...")
-        final_blog = humanizer_agent(raw_blog, keyword)
-
-        # Re-run SEO check on humanized content
-        final_seo = seo_optimizer_agent(keyword, final_blog, outline)
+        print("[3/3] Humanize")
+        final_blog = humanize_blog(raw_blog, keyword)
+        final_seo  = seo_score(keyword, final_blog, outline)
 
         return jsonify({
-            "success": True,
-            "keyword": keyword,
-            "intent": intent,
-            "keywords": keywords,
-            "serp_gaps": serp_gaps,
-            "outline": outline,
+            "success":    True,
+            "keyword":    keyword,
+            "intent":     research.get("intent", {}),
+            "keywords":   research.get("keywords", {}),
+            "serp_gaps":  research.get("serp_gaps", {}),
+            "outline":    outline,
             "seo_report": final_seo,
             "final_blog": final_blog
         })
 
     except Exception as e:
-        print(f"[ERROR] {str(e)}")
-        return jsonify({"error": f"Generation failed: {str(e)}"}), 500
+        print(f"[ERROR] {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/")
