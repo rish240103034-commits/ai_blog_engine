@@ -1,229 +1,236 @@
 """
 AI Blog Engine - Multi-Agent Blog Generation System
-Backend: Flask + Google Gemini API (Free)
+Backend: Flask + Groq API (FREE, unlimited, ultra-fast)
 
-OPTIMIZED: 3 batched Gemini calls instead of 7 sequential ones.
-Completes in ~20s — safe for Render free tier (30s timeout).
+Groq free tier: 30 req/min, 14,400 req/day — no credit card needed.
+3 batched calls complete in ~8 seconds — well within Render's 30s limit.
 """
 
 import os
 import json
 import re
-import time
 from flask import Flask, request, jsonify, render_template
-import google.generativeai as genai
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+import urllib.parse
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────
-# CONFIGURATION
+# CONFIGURATION — Groq API (Free)
+# Get your free key at: https://console.groq.com
 # ─────────────────────────────────────────────
-# Primary key — set in Render > Environment
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-# Optional backup key from a second Google account (leave blank if unused)
-GEMINI_API_KEY2 = os.environ.get("GEMINI_API_KEY2", "")
-
-_models = {}  # cache per key
-
-def get_model(key: str):
-    if key in _models:
-        return _models[key]
-    genai.configure(api_key=key)
-    _models[key] = genai.GenerativeModel("gemini-2.0-flash")
-    return _models[key]
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL     = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL   = "llama-3.3-70b-versatile"   # best free model on Groq
 
 
-def call_gemini(prompt: str, retries: int = 3) -> str:
-    """Call Gemini. On 429, auto-switch to backup key if available."""
-    keys = [k for k in [GEMINI_API_KEY, GEMINI_API_KEY2] if k]
-    if not keys:
+def call_groq(prompt: str) -> str:
+    """
+    Call Groq API using only Python stdlib (urllib) — no extra packages needed.
+    Groq free tier: 30 req/min, 14,400 req/day, responses in ~1-2 seconds.
+    """
+    if not GROQ_API_KEY:
         raise ValueError(
-            "GEMINI_API_KEY not set. Render > your service > Environment > add GEMINI_API_KEY."
+            "GROQ_API_KEY not set. "
+            "Get free key at https://console.groq.com → Render > Environment > GROQ_API_KEY"
         )
-    last_err = None
-    for key in keys:
-        m = get_model(key)
-        for attempt in range(retries):
-            try:
-                response = m.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                msg = str(e)
-                is_rate = "429" in msg or "quota" in msg.lower() or "rate" in msg.lower()
-                if is_rate and attempt < retries - 1:
-                    wait = 5 * (attempt + 1)
-                    print(f"[Rate limit on key ...{key[-6:]}] waiting {wait}s...")
-                    time.sleep(wait)
-                elif is_rate:
-                    last_err = e
-                    print(f"[Key ...{key[-6:]}] exhausted, trying backup key...")
-                    break  # try next key
-                else:
-                    raise  # non-rate errors bubble up immediately
-    raise RuntimeError(
-        "429 Rate limit exceeded on all keys. Wait 1 minute and try again. "
-        "Tip: add GEMINI_API_KEY2 in Render Environment with a key from a second Google account."
+
+    payload = json.dumps({
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 4096,
+    }).encode("utf-8")
+
+    req = Request(
+        GROQ_URL,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST"
     )
 
+    try:
+        with urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"].strip()
+    except URLError as e:
+        raise RuntimeError(f"Groq API error: {e.reason}")
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"Groq response parse error: {e}")
 
-# ── BATCH CALL 1: Intent + Keywords + SERP Gap (3 agents, 1 API call)
+
+def safe_json(raw: str, fallback: dict) -> dict:
+    """Strip markdown fences and parse JSON safely."""
+    cleaned = re.sub(r"```json|```", "", raw).strip()
+    # Sometimes model wraps in extra text — extract the JSON object
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if match:
+        cleaned = match.group(0)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return fallback
+
+
+# ─────────────────────────────────────────────
+# CALL 1 — Research Agent (Intent + Keywords + SERP)
+# ─────────────────────────────────────────────
 def batch_research(keyword: str) -> dict:
-    prompt = f"""
-You are a multi-agent SEO research system. For the keyword "{keyword}", run all three
-agents below and return ONE valid JSON object containing all results.
+    prompt = f"""You are an SEO research system. Analyze the keyword "{keyword}" and return ONE JSON object.
 
-Return ONLY this JSON (no markdown fences, no extra text):
+Return ONLY valid JSON (no markdown, no explanation):
 {{
   "intent": {{
-    "intent_type": "informational|commercial|transactional|navigational",
-    "confidence": "high|medium|low",
-    "reasoning": "brief reason",
-    "user_goal": "what user wants to achieve",
-    "content_type": "best content type e.g. how-to guide"
+    "intent_type": "informational",
+    "confidence": "high",
+    "reasoning": "Users want to learn about this topic",
+    "user_goal": "Understand and learn",
+    "content_type": "How-to guide"
   }},
   "keywords": {{
     "primary_keyword": "{keyword}",
-    "secondary_keywords": ["kw1", "kw2", "kw3", "kw4", "kw5"],
-    "long_tail_keywords": ["phrase1", "phrase2", "phrase3", "phrase4"],
-    "lsi_keywords": ["lsi1", "lsi2", "lsi3"],
-    "question_keywords": ["What is...?", "How to...?", "Why does...?", "When should...?"],
-    "search_volume_estimate": "high|medium|low",
-    "competition_level": "high|medium|low"
+    "secondary_keywords": ["related term 1", "related term 2", "related term 3", "related term 4", "related term 5"],
+    "long_tail_keywords": ["long tail phrase 1", "long tail phrase 2", "long tail phrase 3", "long tail phrase 4"],
+    "lsi_keywords": ["semantic term 1", "semantic term 2", "semantic term 3"],
+    "question_keywords": ["What is {keyword}?", "How to use {keyword}?", "Why is {keyword} important?", "When to use {keyword}?"],
+    "search_volume_estimate": "high",
+    "competition_level": "medium"
   }},
   "serp_gaps": {{
-    "common_topics_covered": ["topic1", "topic2", "topic3"],
-    "content_gaps": ["Gap 1: ...", "Gap 2: ...", "Gap 3: ..."],
-    "unique_angles": ["Angle 1", "Angle 2", "Angle 3"],
-    "competitor_weaknesses": ["Weakness 1", "Weakness 2"],
-    "our_opportunity": "The biggest content opportunity in one sentence",
-    "recommended_word_count": 1600
+    "common_topics_covered": ["Basic overview", "Common use cases", "Getting started"],
+    "content_gaps": ["In-depth practical examples", "Common mistakes to avoid", "Expert tips not found elsewhere"],
+    "unique_angles": ["Real-world case studies", "Step-by-step actionable guide", "Comparison with alternatives"],
+    "competitor_weaknesses": ["Lack of practical examples", "Outdated information"],
+    "our_opportunity": "Create the most practical, up-to-date, example-rich guide on {keyword}",
+    "recommended_word_count": 1500
   }}
-}}
-"""
-    raw = call_gemini(prompt)
-    raw = re.sub(r"```json|```", "", raw).strip()
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {
-            "intent": {
-                "intent_type": "informational", "confidence": "medium",
-                "reasoning": "Analysis complete", "user_goal": "Learn about the topic",
-                "content_type": "Educational guide"
-            },
-            "keywords": {
-                "primary_keyword": keyword, "secondary_keywords": [],
-                "long_tail_keywords": [], "lsi_keywords": [], "question_keywords": [],
-                "search_volume_estimate": "medium", "competition_level": "medium"
-            },
-            "serp_gaps": {
-                "common_topics_covered": [], "content_gaps": ["Depth", "Examples", "Stats"],
-                "unique_angles": [], "competitor_weaknesses": [],
-                "our_opportunity": "Comprehensive coverage", "recommended_word_count": 1600
-            }
+}}"""
+
+    raw = call_groq(prompt)
+    return safe_json(raw, {
+        "intent": {
+            "intent_type": "informational", "confidence": "medium",
+            "reasoning": "General topic research", "user_goal": "Learn about the topic",
+            "content_type": "Educational guide"
+        },
+        "keywords": {
+            "primary_keyword": keyword, "secondary_keywords": [keyword + " guide", keyword + " tips"],
+            "long_tail_keywords": ["how to " + keyword, "best " + keyword + " strategies"],
+            "lsi_keywords": [], "question_keywords": ["What is " + keyword + "?"],
+            "search_volume_estimate": "medium", "competition_level": "medium"
+        },
+        "serp_gaps": {
+            "common_topics_covered": ["Overview", "Basics"],
+            "content_gaps": ["Practical examples", "Expert insights"],
+            "unique_angles": ["Step-by-step guide"],
+            "competitor_weaknesses": ["Surface-level content"],
+            "our_opportunity": "Comprehensive practical guide",
+            "recommended_word_count": 1500
         }
+    })
 
 
-# ── BATCH CALL 2: Outline + Blog (2 agents, 1 API call)
+# ─────────────────────────────────────────────
+# CALL 2 — Outline + Blog Generator
+# ─────────────────────────────────────────────
 def batch_outline_and_blog(keyword: str, research: dict) -> dict:
     kws       = research.get("keywords", {})
     gaps      = research.get("serp_gaps", {})
     secondary = ", ".join(kws.get("secondary_keywords", [])[:4])
-    long_tail = ", ".join(kws.get("long_tail_keywords", [])[:3])
-    gap_list  = "\n".join(f"- {g}" for g in gaps.get("content_gaps", []))
-    angles    = "\n".join(f"- {a}" for a in gaps.get("unique_angles", []))
+    gap_list  = "; ".join(gaps.get("content_gaps", [])[:3])
+    angles    = "; ".join(gaps.get("unique_angles", [])[:2])
 
-    prompt = f"""
-You are a dual-mode SEO content system. For the keyword "{keyword}", complete TWO tasks
-and return ONE JSON object.
+    prompt = f"""You are an SEO content writer. For the keyword "{keyword}", write a complete blog post.
 
 Context:
-- Secondary keywords: {secondary}
-- Long-tail keywords: {long_tail}
-- Content gaps:
-{gap_list}
-- Unique angles:
-{angles}
+- Secondary keywords to include: {secondary}
+- Content gaps to address: {gap_list}
+- Unique angles: {angles}
 
-TASK 1: Create the SEO blog outline.
-TASK 2: Write the full blog post following that outline.
-
-Blog rules:
-- 1200-1500 words
-- Use ## for H2 headings, ### for H3
-- Use "{keyword}" naturally throughout
-- Conversational expert tone with personality
-- No cliches: no "In conclusion", "In today's world", "Delve into"
-- Include practical tips and real examples
-
-Return ONLY this JSON (no markdown fences, no extra text):
+Write a full 1200-1500 word blog post. Return ONLY valid JSON (no markdown fences):
 {{
   "outline": {{
-    "h1_title": "Compelling SEO title containing the keyword",
-    "meta_description": "150-160 char meta description with keyword",
-    "intro_hook": "One sentence hook",
+    "h1_title": "Engaging SEO title containing '{keyword}'",
+    "meta_description": "Compelling 150-160 character meta description with '{keyword}'",
+    "intro_hook": "One-line description of the intro hook",
     "sections": [
-      {{
-        "h2": "Section heading",
-        "purpose": "what this section covers",
-        "h3_subsections": ["Subsection 1", "Subsection 2"]
-      }}
+      {{"h2": "Section title", "purpose": "What it covers", "h3_subsections": ["Sub 1", "Sub 2"]}},
+      {{"h2": "Section title 2", "purpose": "What it covers", "h3_subsections": ["Sub 1", "Sub 2"]}},
+      {{"h2": "Section title 3", "purpose": "What it covers", "h3_subsections": ["Sub 1"]}},
+      {{"h2": "Section title 4", "purpose": "What it covers", "h3_subsections": ["Sub 1", "Sub 2"]}},
+      {{"h2": "Section title 5", "purpose": "What it covers", "h3_subsections": ["Sub 1"]}}
     ],
-    "conclusion_summary": "What the conclusion covers",
+    "conclusion_summary": "Brief conclusion description",
     "estimated_read_time": "7 min read",
     "target_word_count": 1400
   }},
-  "blog": "FULL BLOG POST IN MARKDOWN. Use actual newline characters for line breaks."
+  "blog": "# H1 Title Here\\n\\nIntroduction paragraph here...\\n\\n## Section 1\\n\\nContent here...\\n\\n### Subsection\\n\\nContent...\\n\\n## Section 2\\n\\nMore content... (write full 1200-1500 word blog in markdown using \\\\n for newlines)"
 }}
-"""
-    raw = call_gemini(prompt)
-    raw = re.sub(r"```json|```", "", raw).strip()
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {
-            "outline": {
-                "h1_title": f"The Complete Guide to {keyword}",
-                "meta_description": f"Everything about {keyword}: expert tips, strategies, and practical advice you can use today.",
-                "intro_hook": f"Introduction to {keyword}",
-                "sections": [],
-                "conclusion_summary": "Key takeaways",
-                "estimated_read_time": "7 min read",
-                "target_word_count": 1400
-            },
-            "blog": raw
+
+IMPORTANT: The blog field must contain the COMPLETE blog post in markdown format with proper ## and ### headings, at least 1200 words, practical examples, and the keyword '{keyword}' used naturally throughout."""
+
+    raw = call_groq(prompt)
+    result = safe_json(raw, {})
+
+    # Fallback if blog field is missing or too short
+    if not result.get("blog") or len(result.get("blog","").split()) < 200:
+        result["blog"] = raw  # use raw text as blog
+
+    if not result.get("outline"):
+        result["outline"] = {
+            "h1_title": f"The Complete Guide to {keyword}",
+            "meta_description": f"Discover everything about {keyword} with expert tips, practical examples, and actionable strategies you can use today.",
+            "intro_hook": f"Hook about {keyword}",
+            "sections": [],
+            "conclusion_summary": "Key takeaways",
+            "estimated_read_time": "7 min read",
+            "target_word_count": 1400
         }
 
+    return result
 
-# ── BATCH CALL 3: Humanizer (1 API call)
+
+# ─────────────────────────────────────────────
+# CALL 3 — Humanizer Agent
+# ─────────────────────────────────────────────
 def humanize_blog(blog_content: str, keyword: str) -> str:
-    if len(blog_content.split()) < 100:
+    word_count = len(blog_content.split())
+    if word_count < 150:
         return blog_content
 
-    prompt = f"""
-Rewrite the blog below to sound genuinely human — confident, warm, expert.
-Keep all markdown headings (## and ###) and the keyword "{keyword}".
+    prompt = f"""Rewrite this blog post to sound authentically human — expert, warm, and engaging.
 
 Rules:
-- Keep 1200-1500 words
-- Vary sentence length dramatically
-- Use contractions naturally (it's, you'll, don't, we're)
-- Remove AI cliches (delve, It's worth noting, In today's fast-paced world)
-- Add one or two rhetorical questions
-- Keep every ## and ### heading exactly as written
+- Keep ALL ## and ### markdown headings exactly as they are
+- Keep the keyword "{keyword}" throughout
+- Use contractions (it's, you'll, don't, we're, they're)
+- Vary sentence length: mix short punchy sentences with longer detailed ones
+- Remove all AI clichés: "delve into", "in today's fast-paced world", "it's worth noting", "leverage"
+- Add 1-2 rhetorical questions to engage readers
+- Keep 1200-1400 words
+- Maintain all practical examples and tips
 
-Blog:
+Blog to humanize:
 ---
-{blog_content[:5000]}
+{blog_content[:5500]}
 ---
 
-Write the humanized version in markdown now (no JSON, just the blog text):
-"""
-    result = call_gemini(prompt)
-    return result if result and len(result.split()) > 80 else blog_content
+Write ONLY the humanized blog in markdown (no JSON, no explanation):"""
+
+    result = call_groq(prompt)
+    # Only use result if it's a real blog (not empty/error)
+    if result and len(result.split()) > 150:
+        return result
+    return blog_content
 
 
-# ── SEO Scorer (pure Python — no API call)
+# ─────────────────────────────────────────────
+# SEO SCORER (pure Python — instant, no API)
+# ─────────────────────────────────────────────
 def seo_score(keyword: str, blog: str, outline: dict) -> dict:
     wc       = len(blog.split())
     kw_count = blog.lower().count(keyword.lower())
@@ -257,7 +264,7 @@ def seo_score(keyword: str, blog: str, outline: dict) -> dict:
     if keyword.lower() in title.lower():  score += 10
     else:                                 recs.append("Add the primary keyword to the H1 title.")
 
-    if wc > 0 and kw_count > 0:  score += 10
+    if wc > 0 and kw_count > 0: score += 10
 
     score = min(score, 100)
     return {
@@ -286,9 +293,10 @@ def generate():
         return jsonify({"error": "Keyword cannot be empty"}), 400
     if len(keyword) > 200:
         return jsonify({"error": "Keyword too long (max 200 chars)"}), 400
-    if not GEMINI_API_KEY:
+    if not GROQ_API_KEY:
         return jsonify({"error":
-            "GEMINI_API_KEY not set. Render > your service > Environment > add GEMINI_API_KEY."}), 500
+            "GROQ_API_KEY not set. Get free key at https://console.groq.com "
+            "then add it in Render > your service > Environment."}), 500
 
     try:
         print(f"[1/3] Research — {keyword}")
@@ -326,7 +334,7 @@ def index():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  AI Blog Engine — Multi-Agent System")
+    print("  AI Blog Engine — Powered by Groq (Free)")
     print("  Running at http://localhost:5000")
     print("=" * 50)
     app.run(debug=True, port=5000)
