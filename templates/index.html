@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Blog Engine — Multi-Agent System</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+  <!-- ── BACKGROUND GRID ── -->
+  <div class="bg-grid"></div>
+  <div class="bg-orbs">
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+  </div>
+
+  <!-- ── HEADER ── -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="logo">
+        <span class="logo-icon">◈</span>
+        <span class="logo-text">AI Blog <em>Engine</em></span>
+      </div>
+      <div class="header-right">
+        <span class="badge">7 Agents</span>
+        <button class="theme-toggle" id="themeToggle" title="Toggle theme">
+          <span class="theme-icon">◐</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── MAIN ── -->
+  <main>
+
+    <!-- Hero Section -->
+    <section class="hero">
+      <div class="hero-eyebrow">
+        <span class="pulse-dot"></span>
+        Multi-Agent AI Pipeline
+      </div>
+      <h1 class="hero-title">
+        Turn a keyword into a<br/>
+        <em>rank-worthy blog</em><br/>
+        in seconds.
+      </h1>
+      <p class="hero-sub">7 specialized AI agents analyze, cluster, outline, write, optimize, and humanize your content — fully automated.</p>
+
+      <!-- Agent Pipeline Visualization -->
+      <div class="agent-pipeline">
+        <div class="agent-step" data-agent="1">
+          <span class="step-num">01</span>
+          <span class="step-name">Intent</span>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="agent-step" data-agent="2">
+          <span class="step-num">02</span>
+          <span class="step-name">Keywords</span>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="agent-step" data-agent="3">
+          <span class="step-num">03</span>
+          <span class="step-name">SERP Gap</span>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="agent-step" data-agent="4">
+          <span class="step-num">04</span>
+          <span class="step-name">Outline</span>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="agent-step" data-agent="5">
+          <span class="step-num">05</span>
+          <span class="step-name">Generate</span>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="agent-step" data-agent="6">
+          <span class="step-num">06</span>
+          <span class="step-name">SEO Check</span>
+        </div>
+        <div class="pipeline-arrow">→</div>
+        <div class="agent-step" data-agent="7">
+          <span class="step-num">07</span>
+          <span class="step-name">Humanize</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Input Section -->
+    <section class="input-section">
+      <div class="input-card">
+        <label class="input-label" for="keywordInput">Enter Your Target Keyword</label>
+        <div class="input-row">
+          <div class="input-wrapper">
+            <span class="input-prefix">⌕</span>
+            <input
+              type="text"
+              id="keywordInput"
+              class="keyword-input"
+              placeholder="e.g. best productivity apps for remote workers"
+              autocomplete="off"
+            />
+          </div>
+          <button class="generate-btn" id="generateBtn">
+            <span class="btn-text">Generate Blog</span>
+            <span class="btn-icon">↗</span>
+          </button>
+        </div>
+        <div class="input-hints">
+          <span>Try: "how to learn Python fast"</span>
+          <span>•</span>
+          <span>"best electric cars 2025"</span>
+          <span>•</span>
+          <span>"home workout without equipment"</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Loading State -->
+    <section class="loading-section" id="loadingSection" style="display:none;">
+      <div class="loading-card">
+        <div class="loading-orb-container">
+          <div class="loading-orb"></div>
+          <div class="loading-ring ring-1"></div>
+          <div class="loading-ring ring-2"></div>
+          <div class="loading-ring ring-3"></div>
+        </div>
+        <div class="loading-text-container">
+          <p class="loading-title" id="loadingTitle">Initializing Agents...</p>
+          <p class="loading-sub" id="loadingSubtext">Setting up the multi-agent pipeline</p>
+        </div>
+        <div class="loading-steps">
+          <div class="loading-step" id="ls-1">
+            <span class="ls-icon">◉</span>
+            <span>Agent 01 — Intent Analyzer</span>
+            <span class="ls-status" id="lss-1">waiting</span>
+          </div>
+          <div class="loading-step" id="ls-2">
+            <span class="ls-icon">◉</span>
+            <span>Agent 02 — Keyword Clustering</span>
+            <span class="ls-status" id="lss-2">waiting</span>
+          </div>
+          <div class="loading-step" id="ls-3">
+            <span class="ls-icon">◉</span>
+            <span>Agent 03 — SERP Gap Analysis</span>
+            <span class="ls-status" id="lss-3">waiting</span>
+          </div>
+          <div class="loading-step" id="ls-4">
+            <span class="ls-icon">◉</span>
+            <span>Agent 04 — Outline Generator</span>
+            <span class="ls-status" id="lss-4">waiting</span>
+          </div>
+          <div class="loading-step" id="ls-5">
+            <span class="ls-icon">◉</span>
+            <span>Agent 05 — Blog Generator</span>
+            <span class="ls-status" id="lss-5">waiting</span>
+          </div>
+          <div class="loading-step" id="ls-6">
+            <span class="ls-icon">◉</span>
+            <span>Agent 06 — SEO Optimizer</span>
+            <span class="ls-status" id="lss-6">waiting</span>
+          </div>
+          <div class="loading-step" id="ls-7">
+            <span class="ls-icon">◉</span>
+            <span>Agent 07 — Humanizer</span>
+            <span class="ls-status" id="lss-7">waiting</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Results Section -->
+    <section class="results-section" id="resultsSection" style="display:none;">
+
+      <!-- Results Header -->
+      <div class="results-header">
+        <div>
+          <div class="results-eyebrow">Generation Complete</div>
+          <h2 class="results-title">Your Blog is Ready</h2>
+        </div>
+        <div class="results-meta" id="resultsMeta"></div>
+      </div>
+
+      <!-- Stats Bar -->
+      <div class="stats-bar" id="statsBar"></div>
+
+      <!-- Tab Navigation -->
+      <div class="tab-nav">
+        <button class="tab-btn active" data-tab="intent">
+          <span class="tab-num">01</span> Intent
+        </button>
+        <button class="tab-btn" data-tab="keywords">
+          <span class="tab-num">02</span> Keywords
+        </button>
+        <button class="tab-btn" data-tab="serp">
+          <span class="tab-num">03</span> SERP Gap
+        </button>
+        <button class="tab-btn" data-tab="outline">
+          <span class="tab-num">04</span> Outline
+        </button>
+        <button class="tab-btn" data-tab="seo">
+          <span class="tab-num">06</span> SEO Score
+        </button>
+        <button class="tab-btn highlight" data-tab="blog">
+          <span class="tab-num">★</span> Final Blog
+        </button>
+      </div>
+
+      <!-- Tab Panels -->
+      <div class="tab-panels">
+
+        <!-- Intent Panel -->
+        <div class="tab-panel active" id="panel-intent">
+          <div id="intentContent"></div>
+        </div>
+
+        <!-- Keywords Panel -->
+        <div class="tab-panel" id="panel-keywords">
+          <div id="keywordsContent"></div>
+        </div>
+
+        <!-- SERP Gap Panel -->
+        <div class="tab-panel" id="panel-serp">
+          <div id="serpContent"></div>
+        </div>
+
+        <!-- Outline Panel -->
+        <div class="tab-panel" id="panel-outline">
+          <div id="outlineContent"></div>
+        </div>
+
+        <!-- SEO Panel -->
+        <div class="tab-panel" id="panel-seo">
+          <div id="seoContent"></div>
+        </div>
+
+        <!-- Blog Panel -->
+        <div class="tab-panel" id="panel-blog">
+          <div class="blog-toolbar">
+            <div class="blog-toolbar-left">
+              <span class="word-count-badge" id="wordCountBadge">0 words</span>
+              <span class="read-time-badge" id="readTimeBadge">0 min read</span>
+            </div>
+            <div class="blog-toolbar-right">
+              <button class="toolbar-btn" id="copyBtn">
+                <span>⧉</span> Copy Blog
+              </button>
+              <button class="toolbar-btn" id="downloadBtn">
+                <span>↓</span> Download
+              </button>
+            </div>
+          </div>
+          <div class="blog-content-wrapper">
+            <div class="blog-content" id="blogContent"></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- Error Section -->
+    <section class="error-section" id="errorSection" style="display:none;">
+      <div class="error-card">
+        <div class="error-icon">⚠</div>
+        <h3>Generation Failed</h3>
+        <p id="errorMessage">An error occurred. Please try again.</p>
+        <button class="retry-btn" id="retryBtn">Try Again</button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ── FOOTER ── -->
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <span>AI Blog Engine</span>
+      <span class="footer-sep">◈</span>
+      <span>7-Agent Pipeline powered by Google Gemini</span>
+    </div>
+  </footer>
+
+  <!-- Toast Notification -->
+  <div class="toast" id="toast"></div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
