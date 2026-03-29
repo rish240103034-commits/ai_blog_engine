@@ -390,7 +390,7 @@ def index():
 
 if __name__ == "__main__":
     print("=" * 50)
-    print("  AI Blog Engine — Powered by Groq (Free)")
+    print("  AI Blog Engine — Multi-Agent System")
     print("  Running at http://localhost:5000")
     print("=" * 50)
     app.run(debug=True, port=5000)
