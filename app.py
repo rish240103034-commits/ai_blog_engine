@@ -2,17 +2,13 @@
 AI Blog Engine - Multi-Agent Blog Generation System
 Backend: Flask + Groq API (FREE — 14,400 req/day, ~1s response)
 Get your free key at: https://console.groq.com
-
-ROBUST VERSION: Separate calls for research vs blog writing,
-with plain-text blog generation (no JSON parsing issues).
 """
 
 import os
 import json
 import re
+import requests
 from flask import Flask, request, jsonify, render_template
-from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 app = Flask(__name__)
 
@@ -25,34 +21,64 @@ GROQ_MODEL   = "llama-3.3-70b-versatile"
 
 
 def call_groq(prompt: str, max_tokens: int = 4096) -> str:
-    """Call Groq API. Raises on error so we see real error messages."""
+    """
+    Call Groq API using the requests library.
+    Raises a clear error message on any failure.
+    """
     if not GROQ_API_KEY:
         raise ValueError(
-            "GROQ_API_KEY not set. Get free key at https://console.groq.com "
+            "GROQ_API_KEY not set. "
+            "Get free key at https://console.groq.com "
             "then add to Render > Environment > GROQ_API_KEY"
         )
-    payload = json.dumps({
-        "model": GROQ_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7,
-        "max_tokens": max_tokens,
-    }).encode("utf-8")
 
-    req = Request(GROQ_URL, data=payload, headers={
+    headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type":  "application/json",
-    }, method="POST")
+    }
+    payload = {
+        "model":       GROQ_MODEL,
+        "messages":    [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens":  max_tokens,
+    }
 
-    with urlopen(req, timeout=25) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
+    try:
+        resp = requests.post(GROQ_URL, headers=headers, json=payload, timeout=25)
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Groq API timed out. Try again.")
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError("Cannot reach Groq API. Check network.")
+
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "Groq API key is invalid (401 Unauthorized). "
+            "Go to https://console.groq.com/keys, create a new key, "
+            "and update GROQ_API_KEY in Render > Environment."
+        )
+    if resp.status_code == 403:
+        raise RuntimeError(
+            "Groq API key is forbidden (403). "
+            "Your key may be invalid or your Groq account needs verification. "
+            "Go to https://console.groq.com/keys and create a fresh key."
+        )
+    if resp.status_code == 429:
+        raise RuntimeError(
+            "Groq rate limit hit (429). Wait 1 minute and try again. "
+            "Free tier: 30 requests/minute."
+        )
+    if not resp.ok:
+        raise RuntimeError(f"Groq API error {resp.status_code}: {resp.text[:200]}")
+
+    try:
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected Groq response format: {resp.text[:200]}")
 
 
 def parse_json_safe(raw: str, fallback: dict) -> dict:
-    """Try to extract and parse JSON from a response, return fallback on failure."""
-    # Remove markdown code fences
+    """Strip markdown fences and parse JSON, return fallback on failure."""
     cleaned = re.sub(r"```json\s*|```\s*", "", raw).strip()
-    # Find the outermost { ... } block
     match = re.search(r"\{[\s\S]*\}", cleaned)
     if match:
         try:
@@ -63,7 +89,7 @@ def parse_json_safe(raw: str, fallback: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
-# AGENT 1 — Intent + Keywords + SERP (JSON)
+# AGENT 1 — Research (Intent + Keywords + SERP)
 # ─────────────────────────────────────────────
 def agent_research(keyword: str) -> dict:
     prompt = f"""You are an SEO research expert. Analyze the keyword: "{keyword}"
@@ -83,7 +109,7 @@ Respond with ONLY a valid JSON object. No explanation, no markdown fences, just 
     "secondary_keywords": ["term1", "term2", "term3", "term4", "term5"],
     "long_tail_keywords": ["long phrase 1", "long phrase 2", "long phrase 3"],
     "lsi_keywords": ["related1", "related2", "related3"],
-    "question_keywords": ["What is {keyword}?", "How to {keyword}?", "Why {keyword} matters?"],
+    "question_keywords": ["What is {keyword}?", "How to use {keyword}?", "Why does {keyword} matter?"],
     "search_volume_estimate": "medium",
     "competition_level": "medium"
   }},
@@ -101,22 +127,28 @@ Respond with ONLY a valid JSON object. No explanation, no markdown fences, just 
     return parse_json_safe(raw, {
         "intent": {
             "intent_type": "informational", "confidence": "medium",
-            "reasoning": "General topic", "user_goal": "Learn about the topic",
+            "reasoning": "General informational topic",
+            "user_goal": "Learn about the topic",
             "content_type": "Educational guide"
         },
         "keywords": {
             "primary_keyword": keyword,
-            "secondary_keywords": [f"{keyword} guide", f"{keyword} tips", f"best {keyword}", f"{keyword} tutorial", f"{keyword} examples"],
-            "long_tail_keywords": [f"how to {keyword}", f"best {keyword} for beginners", f"{keyword} step by step"],
+            "secondary_keywords": [f"{keyword} guide", f"{keyword} tips",
+                                   f"best {keyword}", f"{keyword} tutorial",
+                                   f"{keyword} for beginners"],
+            "long_tail_keywords": [f"how to {keyword}", f"best {keyword} for beginners",
+                                   f"{keyword} step by step guide"],
             "lsi_keywords": [f"{keyword} strategy", f"{keyword} techniques", f"{keyword} methods"],
-            "question_keywords": [f"What is {keyword}?", f"How does {keyword} work?", f"Why is {keyword} important?"],
-            "search_volume_estimate": "medium", "competition_level": "medium"
+            "question_keywords": [f"What is {keyword}?", f"How does {keyword} work?",
+                                  f"Why is {keyword} important?"],
+            "search_volume_estimate": "medium",
+            "competition_level": "medium"
         },
         "serp_gaps": {
             "common_topics_covered": ["Basic overview", "Common use cases", "Getting started"],
-            "content_gaps": ["Practical examples", "Expert tips", "Common mistakes"],
-            "unique_angles": ["Step-by-step walkthrough", "Real-world case study"],
-            "competitor_weaknesses": ["Lack of examples", "Outdated info"],
+            "content_gaps": ["In-depth practical examples", "Expert tips", "Common mistakes"],
+            "unique_angles": ["Step-by-step walkthrough", "Real-world case studies"],
+            "competitor_weaknesses": ["Lack of examples", "Outdated information"],
             "our_opportunity": f"Most practical and complete guide on {keyword}",
             "recommended_word_count": 1500
         }
@@ -124,7 +156,7 @@ Respond with ONLY a valid JSON object. No explanation, no markdown fences, just 
 
 
 # ─────────────────────────────────────────────
-# AGENT 2 — Outline (JSON)
+# AGENT 2 — Outline Generator
 # ─────────────────────────────────────────────
 def agent_outline(keyword: str, research: dict) -> dict:
     kws  = research.get("keywords", {})
@@ -133,53 +165,56 @@ def agent_outline(keyword: str, research: dict) -> dict:
     gap  = "; ".join(gaps.get("content_gaps", [])[:3])
 
     prompt = f"""Create an SEO blog outline for the keyword: "{keyword}"
-
-Secondary keywords to include: {sec}
+Secondary keywords: {sec}
 Content gaps to address: {gap}
 
-Respond with ONLY raw JSON (no markdown, no explanation):
+Return ONLY raw JSON (no markdown, no explanation):
 {{
   "h1_title": "Compelling title with '{keyword}'",
-  "meta_description": "150-160 char meta description mentioning '{keyword}'",
-  "intro_hook": "One sentence describing the opening hook",
+  "meta_description": "155 char meta description mentioning '{keyword}'",
+  "intro_hook": "One sentence opening hook description",
   "sections": [
-    {{"h2": "Section 1 Title", "purpose": "what it covers", "h3_subsections": ["Subsection A", "Subsection B"]}},
-    {{"h2": "Section 2 Title", "purpose": "what it covers", "h3_subsections": ["Subsection A", "Subsection B"]}},
-    {{"h2": "Section 3 Title", "purpose": "what it covers", "h3_subsections": ["Subsection A"]}},
-    {{"h2": "Section 4 Title", "purpose": "what it covers", "h3_subsections": ["Subsection A", "Subsection B"]}},
-    {{"h2": "Section 5 Title", "purpose": "what it covers", "h3_subsections": ["Subsection A"]}}
+    {{"h2": "Section 1", "purpose": "covers X", "h3_subsections": ["Sub A", "Sub B"]}},
+    {{"h2": "Section 2", "purpose": "covers Y", "h3_subsections": ["Sub A", "Sub B"]}},
+    {{"h2": "Section 3", "purpose": "covers Z", "h3_subsections": ["Sub A"]}},
+    {{"h2": "Section 4", "purpose": "covers W", "h3_subsections": ["Sub A", "Sub B"]}},
+    {{"h2": "Section 5", "purpose": "covers V", "h3_subsections": ["Sub A"]}}
   ],
-  "conclusion_summary": "What the conclusion covers",
+  "conclusion_summary": "what conclusion covers",
   "estimated_read_time": "7 min read",
   "target_word_count": 1400
 }}"""
 
     raw = call_groq(prompt, max_tokens=1000)
     return parse_json_safe(raw, {
-        "h1_title": f"The Complete Guide to {keyword}: Everything You Need to Know",
-        "meta_description": f"Learn everything about {keyword} with practical tips, expert advice, and step-by-step strategies. Your complete guide starts here.",
-        "intro_hook": f"Hook about {keyword} and why it matters",
+        "h1_title": f"The Complete Guide to {keyword}: Expert Tips & Strategies",
+        "meta_description": (
+            f"Learn everything about {keyword} with expert tips, "
+            f"practical examples and step-by-step strategies."
+        ),
+        "intro_hook": f"Why {keyword} matters more than ever",
         "sections": [
-            {"h2": f"What is {keyword}?", "purpose": "Definition and overview", "h3_subsections": ["Definition", "Why it matters"]},
-            {"h2": f"How {keyword} Works", "purpose": "Mechanics and process", "h3_subsections": ["Core concepts", "Step by step"]},
-            {"h2": f"Benefits of {keyword}", "purpose": "Key advantages", "h3_subsections": ["Top benefits"]},
-            {"h2": f"How to Get Started with {keyword}", "purpose": "Practical guide", "h3_subsections": ["Step 1", "Step 2", "Step 3"]},
-            {"h2": f"Common {keyword} Mistakes to Avoid", "purpose": "Pitfalls", "h3_subsections": ["Mistake 1", "Mistake 2"]},
+            {"h2": f"What Is {keyword}?", "purpose": "Definition",
+             "h3_subsections": ["Definition", "Why it matters"]},
+            {"h2": f"How {keyword} Works", "purpose": "Mechanics",
+             "h3_subsections": ["Core process", "Key components"]},
+            {"h2": f"Top Benefits of {keyword}", "purpose": "Benefits",
+             "h3_subsections": ["Benefit 1", "Benefit 2"]},
+            {"h2": f"How to Get Started with {keyword}", "purpose": "Practical steps",
+             "h3_subsections": ["Step 1", "Step 2", "Step 3"]},
+            {"h2": f"Common {keyword} Mistakes to Avoid", "purpose": "Pitfalls",
+             "h3_subsections": ["Mistake 1", "Mistake 2"]},
         ],
-        "conclusion_summary": "Recap and next steps",
+        "conclusion_summary": "Recap and call to action",
         "estimated_read_time": "7 min read",
         "target_word_count": 1400
     })
 
 
 # ─────────────────────────────────────────────
-# AGENT 3 — Blog Writer (PLAIN TEXT — no JSON)
+# AGENT 3 — Blog Writer (plain markdown, no JSON)
 # ─────────────────────────────────────────────
 def agent_write_blog(keyword: str, outline: dict, keywords: dict) -> str:
-    """
-    Writes the blog as plain markdown text — avoids JSON parsing issues
-    that caused 'no content' problems.
-    """
     sections_text = ""
     for s in outline.get("sections", []):
         sections_text += f"\n## {s.get('h2', '')}\n"
@@ -189,63 +224,65 @@ def agent_write_blog(keyword: str, outline: dict, keywords: dict) -> str:
     secondary = ", ".join(keywords.get("secondary_keywords", [])[:4])
     long_tail  = ", ".join(keywords.get("long_tail_keywords", [])[:2])
 
-    prompt = f"""Write a complete, high-quality SEO blog post.
+    prompt = f"""Write a complete, high-quality SEO blog post in markdown.
 
 Title: {outline.get("h1_title", keyword)}
 Primary keyword: "{keyword}"
-Secondary keywords to use naturally: {secondary}
-Long-tail keywords to include: {long_tail}
+Secondary keywords (use naturally): {secondary}
+Long-tail keywords (include where natural): {long_tail}
 
-Follow this exact structure:
+Use this exact heading structure:
 {sections_text}
 
-Writing rules:
-- Write 1300-1600 words total
-- Start with a compelling 2-3 sentence intro (no heading)
-- Use ## for H2 sections and ### for H3 subsections exactly as shown above
-- Include the keyword "{keyword}" naturally every 150-200 words
-- Write in a confident, friendly, expert tone
-- Include specific practical examples and tips
-- End with a strong conclusion paragraph and call to action
-- NO clichés: never use "delve", "in today's fast-paced world", "it's worth noting", "leverage", "In conclusion"
-- Use contractions naturally (you'll, it's, don't, we're)
+Rules:
+- Write 1300-1600 words
+- Start with a 2-3 sentence intro paragraph (no heading before it)
+- Use ## for H2 and ### for H3 exactly as shown above
+- Use "{keyword}" naturally every 150-200 words
+- Expert, friendly, conversational tone
+- Include practical examples and actionable tips in every section
+- End with a strong call-to-action conclusion paragraph
+- NEVER use: "delve", "in today's fast-paced world", "it's worth noting",
+  "leverage", "In conclusion", "To summarize", "As we've seen"
+- Use contractions freely: you'll, it's, don't, we're, isn't
 
-Write the full blog post now in markdown format:"""
+Write the full blog post now:"""
 
     return call_groq(prompt, max_tokens=4096)
 
 
 # ─────────────────────────────────────────────
-# AGENT 4 — Humanizer (PLAIN TEXT)
+# AGENT 4 — Humanizer
 # ─────────────────────────────────────────────
 def agent_humanize(blog: str, keyword: str) -> str:
     if len(blog.split()) < 200:
         return blog
 
-    prompt = f"""Improve this blog post to sound more natural and human. Keep all ## and ### headings exactly as-is.
+    prompt = f"""Polish this blog post to sound more natural and human.
+Keep ALL ## and ### markdown headings exactly as written.
+Keep the keyword "{keyword}" throughout.
 
-Rules:
-- Keep keyword "{keyword}" throughout
-- Use contractions (it's, you'll, don't)
-- Mix short and long sentences
-- Add 1-2 rhetorical questions
-- Remove any remaining AI phrases
-- Keep 1300-1600 words
-- Keep all markdown ## and ### headings unchanged
+Improvements to make:
+- Use contractions (it's, you'll, don't, they're)
+- Vary sentence lengths — mix short punchy ones with longer detailed ones
+- Add 1-2 genuine rhetorical questions to engage the reader
+- Remove any remaining robotic phrases
+- Maintain 1300-1600 words
+- Keep all ## and ### headings unchanged
 
-Blog to improve:
+Blog:
 ---
-{blog[:5000]}
+{blog[:5500]}
 ---
 
-Write the improved version in markdown (just the blog, nothing else):"""
+Write the polished version in markdown (blog text only, no explanation):"""
 
     result = call_groq(prompt, max_tokens=4096)
     return result if result and len(result.split()) > 200 else blog
 
 
 # ─────────────────────────────────────────────
-# SEO SCORER (pure Python)
+# SEO SCORER (pure Python — no API call)
 # ─────────────────────────────────────────────
 def seo_score(keyword: str, blog: str, outline: dict) -> dict:
     wc       = len(blog.split())
@@ -256,9 +293,8 @@ def seo_score(keyword: str, blog: str, outline: dict) -> dict:
     meta     = outline.get("meta_description", "")
     meta_len = len(meta)
     title    = outline.get("h1_title", "")
-
-    score = 0
-    recs  = []
+    score    = 0
+    recs     = []
 
     if wc >= 1200:   score += 20
     elif wc >= 800:  score += 12; recs.append("Increase word count above 1200.")
@@ -282,9 +318,8 @@ def seo_score(keyword: str, blog: str, outline: dict) -> dict:
 
     if wc > 0 and kw_count > 0: score += 10
 
-    score = min(score, 100)
     return {
-        "seo_score": score,
+        "seo_score": min(score, 100),
         "word_count": wc,
         "keyword_count": kw_count,
         "keyword_density": density,
@@ -315,29 +350,22 @@ def generate():
             "then add to Render > Environment > GROQ_API_KEY"}), 500
 
     try:
-        # Agent 1: Research
         print(f"[1/4] Research — {keyword}")
-        research = agent_research(keyword)
+        research   = agent_research(keyword)
 
-        # Agent 2: Outline
         print("[2/4] Outline")
-        outline  = agent_outline(keyword, research)
+        outline    = agent_outline(keyword, research)
 
-        # Agent 3: Write blog (plain text — no JSON issues)
         print("[3/4] Writing blog")
-        raw_blog = agent_write_blog(keyword, outline, research.get("keywords", {}))
+        raw_blog   = agent_write_blog(keyword, outline, research.get("keywords", {}))
 
-        # Agent 4: Humanize
         print("[4/4] Humanizing")
         final_blog = agent_humanize(raw_blog, keyword)
-
-        # Fallback: if humanized is empty, use raw
         if not final_blog or len(final_blog.split()) < 100:
             final_blog = raw_blog
 
         final_seo = seo_score(keyword, final_blog, outline)
-
-        print(f"[DONE] {final_seo['word_count']} words, SEO score: {final_seo['seo_score']}")
+        print(f"[DONE] {final_seo['word_count']} words | SEO: {final_seo['seo_score']}/100")
 
         return jsonify({
             "success":    True,
